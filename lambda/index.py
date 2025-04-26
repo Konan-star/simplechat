@@ -1,75 +1,61 @@
 # lambda/index.py
 import json
 import os
-import boto3
-import re  # 正規表現モジュールをインポート
+import re
+import urllib3                    
+from urllib3.util import Timeout
+from urllib3.exceptions import HTTPError
 from botocore.exceptions import ClientError
 
+# -------------------------------------------------
+# 追加：FastAPI 接続に使う情報
+# -------------------------------------------------
+FASTAPI_ENDPOINT = os.environ["https://af93-34-48-29-31.ngrok-free.app/docs"]             
+FASTAPI_TIMEOUT  = float(os.environ.get("FASTAPI_TIMEOUT", "20"))
+http = urllib3.PoolManager(
+    headers={"Content-Type": "application/json"},
+    timeout=Timeout(connect=5.0, read=FASTAPI_TIMEOUT)
+)
 
-# Lambda コンテキストからリージョンを抽出する関数
+# 以降のコード（extract_region_from_arn, MODEL_ID など）は元のまま
+# -------------------------------------------------
 def extract_region_from_arn(arn):
-    # ARN 形式: arn:aws:lambda:region:account-id:function:function-name
     match = re.search('arn:aws:lambda:([^:]+):', arn)
-    if match:
-        return match.group(1)
-    return "us-east-1"  # デフォルト値
+    return match.group(1) if match else "us-east-1"
 
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
-
-# モデルID
+bedrock_client = None                   # 既存変数は残しておく
 MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
 
 def lambda_handler(event, context):
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
-        if bedrock_client is None:
-            region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
-        
+        # ---------- 受信ログ ----------
         print("Received event:", json.dumps(event))
         
-        # Cognitoで認証されたユーザー情報を取得
+        # ---------- 認証情報 ----------
         user_info = None
         if 'requestContext' in event and 'authorizer' in event['requestContext']:
             user_info = event['requestContext']['authorizer']['claims']
             print(f"Authenticated user: {user_info.get('email') or user_info.get('cognito:username')}")
         
-        # リクエストボディの解析
+        # ---------- リクエスト解析 ----------
         body = json.loads(event['body'])
         message = body['message']
         conversation_history = body.get('conversationHistory', [])
-        
+
         print("Processing message:", message)
-        print("Using model:", MODEL_ID)
-        
-        # 会話履歴を使用
+
+        # ---------- 会話履歴 ----------
         messages = conversation_history.copy()
-        
-        # ユーザーメッセージを追加
-        messages.append({
-            "role": "user",
-            "content": message
-        })
-        
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
+        messages.append({"role": "user", "content": message})
+
+        # ---------- 既存の Bedrock 形式をそのまま再利用 ----------
         bedrock_messages = []
         for msg in messages:
             if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
+                bedrock_messages.append({"role": "user", "content": [{"text": msg["content"]}]})
+            else:
+                bedrock_messages.append({"role": "assistant", "content": [{"text": msg["content"]}]})
+
         request_payload = {
             "messages": bedrock_messages,
             "inferenceConfig": {
@@ -79,62 +65,65 @@ def lambda_handler(event, context):
                 "topP": 0.9
             }
         }
-        
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
-        
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
+
+        # ---------- FastAPI へ POST ----------
+        print("POST", FASTAPI_ENDPOINT, "payload:", json.dumps(request_payload)[:500])
+        api_resp = http.request(
+            "POST",
+            FASTAPI_ENDPOINT,
+            body=json.dumps(request_payload).encode("utf-8"),
         )
-        
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
-        
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
-        messages.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
-        
-        # 成功レスポンスの返却
+
+        if api_resp.status != 200:
+            raise RuntimeError(f"FastAPI returned {api_resp.status}: {api_resp.data[:300].decode()}")
+
+        response_body = json.loads(api_resp.data.decode("utf-8"))
+        print("FastAPI response:", json.dumps(response_body, default=str))
+
+        # ---------- 応答取り出し ----------
+        assistant_response = (
+            response_body.get("response")        
+            or response_body.get("assistant")      
+            or response_body.get("answer")
+        )
+        if not assistant_response:
+            raise ValueError("No response content from FastAPI")
+
+        messages.append({"role": "assistant", "content": assistant_response})
+
+        # ---------- 成功レスポンス ----------
         return {
             "statusCode": 200,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-                "Access-Control-Allow-Methods": "OPTIONS,POST"
-            },
+            "headers": _cors_headers(),
             "body": json.dumps({
                 "success": True,
                 "response": assistant_response,
                 "conversationHistory": messages
             })
         }
-        
-    except Exception as error:
+
+    except (HTTPError, RuntimeError, ValueError) as error:
         print("Error:", str(error))
-        
-        return {
-            "statusCode": 500,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-                "Access-Control-Allow-Methods": "OPTIONS,POST"
-            },
-            "body": json.dumps({
-                "success": False,
-                "error": str(error)
-            })
-        }
+        return _error(str(error))
+    except Exception as error:
+        print("Unhandled Error:", str(error))
+        return _error("Internal server error")
+
+
+# -------------------------------------------------
+# 共通ヘッダー／エラーレスポンス
+# -------------------------------------------------
+def _cors_headers():
+    return {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+        "Access-Control-Allow-Methods": "OPTIONS,POST"
+    }
+
+def _error(msg):
+    return {
+        "statusCode": 500,
+        "headers": _cors_headers(),
+        "body": json.dumps({"success": False, "error": msg})
+    }
