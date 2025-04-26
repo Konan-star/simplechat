@@ -10,14 +10,13 @@ from botocore.exceptions import ClientError
 # -------------------------------------------------
 # 追加：FastAPI 接続に使う情報
 # -------------------------------------------------
-FASTAPI_ENDPOINT = os.environ["https://af93-34-48-29-31.ngrok-free.app/docs"]             
+FASTAPI_ENDPOINT = os.environ["FASTAPI"]             #こちらにcolab FASTAPIを入力する
 FASTAPI_TIMEOUT  = float(os.environ.get("FASTAPI_TIMEOUT", "20"))
 http = urllib3.PoolManager(
     headers={"Content-Type": "application/json"},
     timeout=Timeout(connect=5.0, read=FASTAPI_TIMEOUT)
 )
 
-# 以降のコード（extract_region_from_arn, MODEL_ID など）は元のまま
 # -------------------------------------------------
 def extract_region_from_arn(arn):
     match = re.search('arn:aws:lambda:([^:]+):', arn)
