@@ -1,128 +1,138 @@
 # lambda/index.py
 import json
 import os
-import re
-import urllib3                    
-from urllib3.util import Timeout
-from urllib3.exceptions import HTTPError
-from botocore.exceptions import ClientError
+import re  # 正規表現モジュールをインポート
+import urllib.request # urllib.request をインポート
+import urllib.parse # urllib.parse をインポート
+from botocore.exceptions import ClientError 
 
-# -------------------------------------------------
-# 追加：FastAPI 接続に使う情報
-# -------------------------------------------------
-FASTAPI_ENDPOINT = os.environ["FASTAPI"]             #こちらにcolab FASTAPIを入力する
-FASTAPI_TIMEOUT  = float(os.environ.get("FASTAPI_TIMEOUT", "20"))
-http = urllib3.PoolManager(
-    headers={"Content-Type": "application/json"},
-    timeout=Timeout(connect=5.0, read=FASTAPI_TIMEOUT)
-)
-
-# -------------------------------------------------
+# Lambda コンテキストからリージョンを抽出する関数
 def extract_region_from_arn(arn):
+    # ARN 形式: arn:aws:lambda:region:account-id:function:function-name
     match = re.search('arn:aws:lambda:([^:]+):', arn)
-    return match.group(1) if match else "us-east-1"
+    if match:
+        return match.group(1)
+    return "us-east-1"  # デフォルト値
 
-bedrock_client = None                   # 既存変数は残しておく
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+# FastAPIエンドポイントのURLを環境変数から取得
+# 環境変数 'FASTAPI_ENDPOINT_URL' にFastAPIのURLを設定
+FASTAPI_ENDPOINT_URL = os.environ.get("FASTAPI_ENDPOINT_URL")
+
+# Bedrockクライアントの初期化は不要になるためコメントアウト
+# bedrock_client = None
+# MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
 
 def lambda_handler(event, context):
     try:
-        # ---------- 受信ログ ----------
+        # FastAPIエンドポイントURLが設定されているか確認
+        if not FASTAPI_ENDPOINT_URL:
+            raise ValueError("Environment variable 'FASTAPI_ENDPOINT_URL' is not set.")
+
+        # Bedrockクライアント初期化部分をコメントアウト
+        # global bedrock_client
+        # if bedrock_client is None:
+        #     region = extract_region_from_arn(context.invoked_function_arn)
+        #     bedrock_client = boto3.client('bedrock-runtime', region_name=region)
+        #     print(f"Initialized Bedrock client in region: {region}")
+
         print("Received event:", json.dumps(event))
-        
-        # ---------- 認証情報 ----------
+
+        # Cognitoで認証されたユーザー情報を取得 (現状維持)
         user_info = None
         if 'requestContext' in event and 'authorizer' in event['requestContext']:
             user_info = event['requestContext']['authorizer']['claims']
             print(f"Authenticated user: {user_info.get('email') or user_info.get('cognito:username')}")
-        
-        # ---------- リクエスト解析 ----------
+
+        # リクエストボディの解析 (現状維持)
         body = json.loads(event['body'])
         message = body['message']
         conversation_history = body.get('conversationHistory', [])
 
         print("Processing message:", message)
+        # print("Using model:", MODEL_ID) # 不要
 
-        # ---------- 会話履歴 ----------
-        messages = conversation_history.copy()
-        messages.append({"role": "user", "content": message})
-
-        # ---------- 既存の Bedrock 形式をそのまま再利用 ----------
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({"role": "user", "content": [{"text": msg["content"]}]})
-            else:
-                bedrock_messages.append({"role": "assistant", "content": [{"text": msg["content"]}]})
-
-        request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
-            }
+        # --- FastAPIエンドポイント呼び出し処理 ---
+        # FastAPIに送信するデータを作成
+        # FastAPI側が受け取る形式に合わせて 'prompt' キーでメッセージを渡す
+        # 会話履歴も必要であれば含める
+        request_data = {
+            "prompt": message,
+            "conversationHistory": conversation_history # 必要に応じてFastAPIに渡す
         }
+        post_data = json.dumps(request_data).encode('utf-8')
 
-        # ---------- FastAPI へ POST ----------
-        print("POST", FASTAPI_ENDPOINT, "payload:", json.dumps(request_payload)[:500])
-        api_resp = http.request(
-            "POST",
-            FASTAPI_ENDPOINT,
-            body=json.dumps(request_payload).encode("utf-8"),
+        print(f"Calling FastAPI endpoint: {FASTAPI_ENDPOINT_URL}")
+        print(f"Sending data: {json.dumps(request_data)}")
+
+        # urllib.request を使用してPOSTリクエストを送信
+        req = urllib.request.Request(
+            FASTAPI_ENDPOINT_URL,
+            data=post_data,
+            headers={'Content-Type': 'application/json'},
+            method='POST' # 明示的にPOSTメソッドを指定
         )
 
-        if api_resp.status != 200:
-            raise RuntimeError(f"FastAPI returned {api_resp.status}: {api_resp.data[:300].decode()}")
+        try:
+            with urllib.request.urlopen(req) as response:
+                # レスポンスコードを確認
+                if response.getcode() == 200:
+                    response_body = response.read().decode('utf-8')
+                    print(f"Received response from FastAPI: {response_body}")
+                    # FastAPIからのレスポンスを解析 (FastAPIのレスポンス形式に合わせる)
+                    api_response = json.loads(response_body)
+                    assistant_response = api_response.get("generated_text") # FastAPIのレスポンスのキーに合わせ、今回はlogを見た感じgenerated_textだった
+                    updated_history = api_response.get("conversationHistory", conversation_history) 
 
-        response_body = json.loads(api_resp.data.decode("utf-8"))
-        print("FastAPI response:", json.dumps(response_body, default=str))
+                    if not assistant_response:
+                        raise Exception("No generated_text content received from FastAPI endpoint.")
 
-        # ---------- 応答取り出し ----------
-        assistant_response = (
-            response_body.get("response")        
-            or response_body.get("assistant")      
-            or response_body.get("answer")
-        )
-        if not assistant_response:
-            raise ValueError("No response content from FastAPI")
+                    # 新しい会話履歴を作成（FastAPIが完全な履歴を返さない場合）
+                    messages = conversation_history.copy()
+                    messages.append({"role": "user", "content": message})
+                    messages.append({"role": "assistant", "content": assistant_response})
 
-        messages.append({"role": "assistant", "content": assistant_response})
+                else:
+                    raise Exception(f"FastAPI endpoint returned status code {response.getcode()}")
+        except urllib.error.HTTPError as e:
+            # HTTPエラー（4xx, 5xx）の場合
+            error_content = e.read().decode('utf-8') if e.readable() else 'No details'
+            print(f"HTTP Error calling FastAPI: {e.code} {e.reason} - {error_content}")
+            raise Exception(f"Failed to call FastAPI endpoint: {e.code} {e.reason}")
+        except urllib.error.URLError as e:
+            # URL関連のエラー（接続失敗など）の場合
+            print(f"URL Error calling FastAPI: {e.reason}")
+            raise Exception(f"Failed to connect to FastAPI endpoint: {e.reason}")
+        # --- FastAPIエンドポイント呼び出し処理 終了 ---
 
-        # ---------- 成功レスポンス ----------
+        # 成功レスポンスの返却 (応答と会話履歴を更新)
         return {
             "statusCode": 200,
-            "headers": _cors_headers(),
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods": "OPTIONS,POST"
+            },
             "body": json.dumps({
                 "success": True,
                 "response": assistant_response,
-                "conversationHistory": messages
+                "conversationHistory": messages # 更新された会話履歴を返す
             })
         }
 
-    except (HTTPError, RuntimeError, ValueError) as error:
-        print("Error:", str(error))
-        return _error(str(error))
     except Exception as error:
-        print("Unhandled Error:", str(error))
-        return _error("Internal server error")
+        print("Error:", str(error))
 
-
-# -------------------------------------------------
-# 共通ヘッダー／エラーレスポンス
-# -------------------------------------------------
-def _cors_headers():
-    return {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-        "Access-Control-Allow-Methods": "OPTIONS,POST"
-    }
-
-def _error(msg):
-    return {
-        "statusCode": 500,
-        "headers": _cors_headers(),
-        "body": json.dumps({"success": False, "error": msg})
-    }
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods": "OPTIONS,POST"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": str(error)
+            })
+        }
